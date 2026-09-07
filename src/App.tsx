@@ -737,6 +737,8 @@ function BakayiseAppContent() {
       periodId: currentPeriod.id,
       title: partialInc.title || 'New Income Stream',
       amount: partialInc.amount || 0,
+      baseAmount: partialInc.baseAmount !== undefined ? partialInc.baseAmount : (partialInc.amount || 0),
+      availableBudgetAmount: partialInc.availableBudgetAmount !== undefined ? partialInc.availableBudgetAmount : (partialInc.amount || 0),
       type: partialInc.type || 'primary_salary',
       sourceTag: partialInc.sourceTag || 'salary',
       accountId: partialInc.accountId,

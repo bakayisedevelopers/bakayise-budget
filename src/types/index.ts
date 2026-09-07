@@ -123,6 +123,8 @@ export interface Income extends EditAuditInfo {
   periodId: string;
   title: string;
   amount: number;
+  baseAmount?: number; // Base planned/expected income (source of truth before transfers)
+  availableBudgetAmount?: number; // Working budgeted amount available after transfers
   type: IncomeType;
   incomeClassification?: 'external_income' | 'internal_transfer' | 'debt_payment_deposit';
   isTransfer?: boolean;
@@ -182,6 +184,8 @@ export interface Expense extends EditAuditInfo {
   notes?: string;
   receiptUrl?: string;
   transferId?: string; // Link related transfer entries
+  sourceIncomeId?: string; // ID of the source income stream whose available budget was debited
+  transferDeductedAmount?: number; // Amount deducted from the source income's available budget
   linkedDebtId?: string; // Optional: Link to a Debt snowball item to deduct balance
   targetAccountId?: string; // Optional: Destination account for internal transfers / card payoffs
   transferType?: 'standard' | 'debt_payment' | 'internal_transfer';

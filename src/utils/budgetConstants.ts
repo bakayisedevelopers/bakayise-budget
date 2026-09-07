@@ -398,12 +398,7 @@ export function isBudgetEligibleIncome(
   inc: Income,
   accountsMap?: Map<string, FinancialAccount> | Record<string, FinancialAccount> | FinancialAccount[]
 ): boolean {
-  // If explicitly classified as a debt payment deposit or tagged as Debt Payoff for fixed liabilities
-  if (inc.incomeClassification === 'debt_payment_deposit' || inc.sourceTag === 'Debt Payoff') {
-    return false;
-  }
-
-  // Check destination account if accounts map/list is available
+  // 1. Check destination account if accounts map/list is available
   if (accountsMap && inc.accountId) {
     let acc: FinancialAccount | undefined;
     if (accountsMap instanceof Map) {
@@ -424,6 +419,11 @@ export function isBudgetEligibleIncome(
         return true;
       }
     }
+  }
+
+  // 2. If explicitly classified as a debt payment deposit or tagged as Debt Payoff for fixed liabilities
+  if (inc.incomeClassification === 'debt_payment_deposit' || inc.sourceTag === 'Debt Payoff') {
+    return false;
   }
 
   // Internal transfers into spendable accounts

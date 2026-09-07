@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { BudgetCategory, Expense, Income, CategoryGroup, FinancialAccount, AccountType, BudgetPeriod } from '../types';
-import { CATEGORY_GROUPS, COMMON_CATEGORY_TAGS, ACCOUNT_TYPES, isExternalIncome, isExternalExpense } from '../utils/budgetConstants';
+import { CATEGORY_GROUPS, COMMON_CATEGORY_TAGS, ACCOUNT_TYPES, isExternalIncome, isExternalExpense, isInternalTransferExpense } from '../utils/budgetConstants';
 import { formatZAR, formatZARCompact, formatDateNice } from '../utils/southAfricaHolidays';
 import { evaluateMathExpression, formatMathLivePreview, isMathExpression } from '../utils/mathEvaluator';
 import { FigmaIcon, FigmaIconName } from './ui/FigmaIcon';
@@ -32,6 +32,7 @@ import {
   X,
   ChevronRight,
   ArrowRightLeft,
+  RefreshCw,
 } from 'lucide-react';
 
 interface ExcelBudgetViewProps {
@@ -108,9 +109,9 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
   const [editingCatField, setEditingCatField] = useState<'name' | 'tag' | 'amount' | 'accountId' | null>(null);
   const [editingCatValue, setEditingCatValue] = useState<string>('');
 
-  // Inline income editing state (title, sourceTag, amount, accountId)
+  // Inline income editing state (title, sourceTag, amount, baseAmount, accountId)
   const [editingIncId, setEditingIncId] = useState<string | null>(null);
-  const [editingIncField, setEditingIncField] = useState<'title' | 'sourceTag' | 'amount' | 'accountId' | null>(null);
+  const [editingIncField, setEditingIncField] = useState<'title' | 'sourceTag' | 'amount' | 'baseAmount' | 'accountId' | null>(null);
   const [editingIncValue, setEditingIncValue] = useState<string>('');
 
   // Quick insert row state at the bottom of the table
@@ -159,10 +160,93 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
     [accounts]
   );
 
+  // Helper to compute accessible spending income for credit cards (installment net principal vs direct full)
+  const getAccessibleIncomeAmount = (inc: Income, acc?: FinancialAccount | null): number => {
+    const isCreditCard = acc?.type === 'credit_card';
+    if (isCreditCard && inc.debtPaymentType === 'installment') {
+      if (inc.principalReduction !== undefined && inc.principalReduction > 0) {
+        return inc.principalReduction;
+      }
+      if (inc.interestCharged !== undefined || inc.feesCharged !== undefined) {
+        return Math.max(0, (inc.amount || 0) - (inc.interestCharged || 0) - (inc.feesCharged || 0));
+      }
+      return inc.amount || 0;
+    }
+    return inc.amount || 0;
+  };
+
   // Filter true eligible incomes (external incomes + eligible inter-account transfers)
   const externalIncomes = useMemo(() => {
-    return incomes.filter((inc) => isExternalIncome(inc, accountMap));
-  }, [incomes, accountMap]);
+    const directEligible = incomes.filter((inc) => isExternalIncome(inc, accountMap));
+
+    // Also include any incoming transfer transactions to credit cards logged in expenses without a matching income in state
+    const existingTransferKeys = new Set(
+      incomes.map((i) => i.transferId || i.linkedExpenseId || i.id)
+    );
+
+    const creditCardIncomingTransfers: Income[] = [];
+    for (const exp of expenses) {
+      if (!exp.targetAccountId) continue;
+      const targetAcc = accountMap.get(exp.targetAccountId);
+      if (targetAcc?.type !== 'credit_card') continue;
+
+      const matchesPeriod = !currentPeriod || exp.periodId === currentPeriod.id;
+      if (!matchesPeriod) continue;
+
+      const isTransfer = isInternalTransferExpense(exp) || Boolean(exp.targetAccountId);
+      if (!isTransfer) continue;
+
+      const transKey = exp.transferId || exp.id;
+      if (
+        existingTransferKeys.has(transKey) ||
+        existingTransferKeys.has(`inc_${exp.id}`) ||
+        existingTransferKeys.has(exp.id)
+      ) {
+        continue;
+      }
+
+      const sourceAcc = exp.accountId ? accountMap.get(exp.accountId) : null;
+      const sourceName = sourceAcc?.name || 'Source Account';
+
+      let accessibleAmt = exp.amount || 0;
+      if (exp.debtPaymentType === 'installment') {
+        if (exp.principalReduction !== undefined && exp.principalReduction > 0) {
+          accessibleAmt = exp.principalReduction;
+        } else if (exp.interestCharged !== undefined || exp.feesCharged !== undefined) {
+          accessibleAmt = Math.max(0, exp.amount - (exp.interestCharged || 0) - (exp.feesCharged || 0));
+        }
+      }
+
+      creditCardIncomingTransfers.push({
+        id: `inc_auto_${exp.id}`,
+        periodId: exp.periodId,
+        title: `Transfer from ${sourceName}${exp.title ? `: ${exp.title}` : ''}`,
+        amount: accessibleAmt,
+        baseAmount: accessibleAmt,
+        availableBudgetAmount: accessibleAmt,
+        type: 'other',
+        incomeClassification: 'internal_transfer',
+        isTransfer: true,
+        sourceTag: 'Internal Transfer',
+        status: 'received',
+        receivedDate: exp.date,
+        accountId: exp.targetAccountId,
+        sourceAccountId: exp.accountId,
+        targetAccountId: exp.targetAccountId,
+        notes: exp.notes,
+        transferId: exp.transferId || exp.id,
+        linkedExpenseId: exp.id,
+        debtPaymentType: exp.debtPaymentType,
+        principalReduction: exp.principalReduction,
+        interestCharged: exp.interestCharged,
+        feesCharged: exp.feesCharged,
+        createdAt: exp.createdAt,
+        updatedAt: exp.updatedAt,
+      });
+    }
+
+    return [...directEligible, ...creditCardIncomingTransfers];
+  }, [incomes, expenses, accountMap, currentPeriod]);
 
   // Dynamic budget capacity ledger per bank account
   const accountCapacityMap = useMemo(() => {
@@ -195,9 +279,19 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
       );
       const expectedIncomes = cycleIncomes
         .filter((inc) => inc.status === 'expected')
-        .reduce((sum, inc) => sum + (inc.amount || 0), 0);
+        .reduce((sum, inc) => {
+          const avail = (isCreditCard && (inc.isTransfer || inc.incomeClassification === 'internal_transfer'))
+            ? getAccessibleIncomeAmount(inc, acc)
+            : (inc.availableBudgetAmount !== undefined ? inc.availableBudgetAmount : (inc.amount || 0));
+          return sum + avail;
+        }, 0);
       const totalIncomesInCycle = cycleIncomes.reduce(
-        (sum, inc) => sum + (inc.amount || 0),
+        (sum, inc) => {
+          const avail = (isCreditCard && (inc.isTransfer || inc.incomeClassification === 'internal_transfer'))
+            ? getAccessibleIncomeAmount(inc, acc)
+            : (inc.availableBudgetAmount !== undefined ? inc.availableBudgetAmount : (inc.amount || 0));
+          return sum + avail;
+        },
         0
       );
 
@@ -278,16 +372,60 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
     return { map, countMap };
   }, [externalExpenses]);
 
-  // Total Planned & Received Incomes (True external income only)
-  const totalPlannedIncome = useMemo(() => {
-    return externalIncomes.reduce((sum, inc) => sum + (inc.amount || 0), 0);
+  // Total Base Expected Incomes (Source of truth before transfers)
+  const totalBaseIncome = useMemo(() => {
+    return externalIncomes.reduce((sum, inc) => {
+      const isTransfer =
+        inc.isTransfer === true ||
+        inc.incomeClassification === 'internal_transfer' ||
+        Boolean(inc.transferId) ||
+        inc.sourceTag === 'Internal Transfer' ||
+        (inc.title && (inc.title.startsWith('Transfer from ') || inc.title.startsWith('ATM Cash Deposit')));
+      if (isTransfer) return sum;
+      const base = inc.baseAmount !== undefined ? inc.baseAmount : (inc.amount || 0);
+      return sum + base;
+    }, 0);
   }, [externalIncomes]);
+
+  // Total Planned & Available Budget Incomes (Uses the Budgeted (Available) amounts)
+  const totalPlannedIncome = useMemo(() => {
+    return externalIncomes.reduce((sum, inc) => {
+      const linked = inc.accountId ? accountMap.get(inc.accountId) : null;
+      const isCreditCard = linked?.type === 'credit_card';
+      const isTransfer =
+        inc.isTransfer === true ||
+        inc.incomeClassification === 'internal_transfer' ||
+        Boolean(inc.transferId) ||
+        inc.sourceTag === 'Internal Transfer' ||
+        (inc.title && (inc.title.startsWith('Transfer from ') || inc.title.startsWith('ATM Cash Deposit')));
+
+      if (isTransfer && isCreditCard) {
+        return sum + getAccessibleIncomeAmount(inc, linked);
+      }
+      const avail = inc.availableBudgetAmount !== undefined ? inc.availableBudgetAmount : (inc.amount || 0);
+      return sum + avail;
+    }, 0);
+  }, [externalIncomes, accountMap]);
 
   const totalReceivedIncome = useMemo(() => {
     return externalIncomes
       .filter((inc) => inc.status === 'received')
-      .reduce((sum, inc) => sum + (inc.amount || 0), 0);
-  }, [externalIncomes]);
+      .reduce((sum, inc) => {
+        const linked = inc.accountId ? accountMap.get(inc.accountId) : null;
+        const isCreditCard = linked?.type === 'credit_card';
+        const isTransfer =
+          inc.isTransfer === true ||
+          inc.incomeClassification === 'internal_transfer' ||
+          Boolean(inc.transferId) ||
+          inc.sourceTag === 'Internal Transfer' ||
+          (inc.title && (inc.title.startsWith('Transfer from ') || inc.title.startsWith('ATM Cash Deposit')));
+
+        if (isTransfer && isCreditCard) {
+          return sum + getAccessibleIncomeAmount(inc, linked);
+        }
+        return sum + (inc.amount || 0);
+      }, 0);
+  }, [externalIncomes, accountMap]);
 
   // Total Budgeted & Actual Expenses (True external spending only)
   const totalBudgetedExpenses = useMemo(() => {
@@ -398,25 +536,157 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
     setEditingCatValue('');
   };
 
+  // Reconcile feedback notification banner
+  const [reconcileFeedback, setReconcileFeedback] = useState<string | null>(null);
+
+  // Handle manual reconciliation of outgoing transfers for an income account
+  const handleReconcileTransfers = async (inc: Income) => {
+    if (!onUpdateIncome) return;
+    const targetAccId = inc.accountId || defaultAccountId;
+    const acc = accountMap.get(targetAccId);
+    const accName = acc?.name || 'Account';
+
+    const isTransfer =
+      inc.isTransfer === true ||
+      inc.incomeClassification === 'internal_transfer' ||
+      Boolean(inc.transferId) ||
+      inc.sourceTag === 'Internal Transfer' ||
+      (inc.title && (inc.title.startsWith('Transfer from ') || inc.title.startsWith('ATM Cash Deposit')));
+
+    const isCreditCardRow = acc?.type === 'credit_card';
+    if (isTransfer || isCreditCardRow) {
+      // Reconcile is strictly for primary external source accounts (cheque, savings, cash)
+      return;
+    }
+
+    // Step 1: Takes in the base amount (reset point)
+    const base = inc.baseAmount !== undefined && inc.baseAmount > 0 ? inc.baseAmount : (inc.amount || 0);
+
+    // Step 2: Scan all outgoing internal transfers that went out from this account in the current cycle.
+    // INCLUDE destination:
+    // - Normal accounts / cash accounts (cheque, savings, cash, tax_free, investment, other)
+    // - Credit cards (credit_card)
+    // STRICTLY EXCLUDE:
+    // - Bond / home loans (home_loan)
+    // - Vehicle finances (vehicle_loan)
+    // - Personal loans (loan)
+    // - Store cards (store_card)
+    const outgoingTransfers = expenses.filter((exp) => {
+      const isExpTransfer = isInternalTransferExpense(exp) || Boolean(exp.targetAccountId);
+      const matchesAccount = exp.accountId === targetAccId;
+      const matchesPeriod = !currentPeriod || exp.periodId === currentPeriod.id;
+      if (!isExpTransfer || !matchesAccount || !matchesPeriod) return false;
+
+      // Check destination account:
+      const destAcc = exp.targetAccountId ? accountMap.get(exp.targetAccountId) : null;
+      if (destAcc) {
+        // Exclude fixed liabilities
+        if (['home_loan', 'vehicle_loan', 'loan', 'store_card'].includes(destAcc.type)) {
+          return false;
+        }
+        // Include normal accounts and credit cards
+        if (['cheque', 'savings', 'cash', 'tax_free', 'investment', 'credit_card', 'other'].includes(destAcc.type)) {
+          return true;
+        }
+      }
+
+      // Fallback check on title or category if destination account was not registered in accountMap
+      const titleLower = (exp.title || '').toLowerCase();
+      const catLower = (exp.categoryId || '').toLowerCase();
+      if (
+        titleLower.includes('bond') ||
+        titleLower.includes('homeloan') ||
+        titleLower.includes('home loan') ||
+        titleLower.includes('mortgage') ||
+        titleLower.includes('vehicle') ||
+        titleLower.includes('car finance') ||
+        titleLower.includes('wesbank') ||
+        titleLower.includes('mfc') ||
+        titleLower.includes('loan') ||
+        titleLower.includes('store card') ||
+        catLower.includes('bond') ||
+        catLower.includes('vehicle') ||
+        catLower.includes('loan')
+      ) {
+        return false;
+      }
+
+      return true;
+    });
+
+    const totalOutgoing = outgoingTransfers.reduce((sum, exp) => sum + (exp.amount || 0), 0);
+    const reconciledBudgeted = Math.max(0, base - totalOutgoing);
+
+    await onUpdateIncome(inc.id, {
+      baseAmount: base,
+      amount: base,
+      availableBudgetAmount: reconciledBudgeted,
+    });
+
+    setReconcileFeedback(
+      `${accName} reconciled: Base ${formatZAR(base)} − ${formatZAR(totalOutgoing)} internal transfers (to normal & credit card accounts; excluding bond & vehicle loans) = ${formatZAR(reconciledBudgeted)} Budgeted`
+    );
+    setTimeout(() => setReconcileFeedback(null), 6000);
+  };
+
   // Handle start inline edit of income fields
-  const handleStartEditIncome = (inc: Income, field: 'title' | 'sourceTag' | 'amount' | 'accountId') => {
+  const handleStartEditIncome = (inc: Income, field: 'title' | 'sourceTag' | 'amount' | 'baseAmount' | 'accountId') => {
+    const isTransfer =
+      inc.isTransfer === true ||
+      inc.incomeClassification === 'internal_transfer' ||
+      Boolean(inc.transferId) ||
+      inc.sourceTag === 'Internal Transfer' ||
+      (inc.title && (inc.title.startsWith('Transfer from ') || inc.title.startsWith('ATM Cash Deposit')));
+
+    // Locked rules:
+    // 1. Base Amount is locked for internal transfers and locked if status is 'received'
+    if (field === 'baseAmount') {
+      if (isTransfer || inc.status === 'received') return;
+    }
+    // 2. Budgeted (amount) is system-calculated and not editable manually
+    if (field === 'amount') {
+      return;
+    }
+
     setEditingIncId(inc.id);
     setEditingIncField(field);
-    if (field === 'amount') setEditingIncValue(inc.amount.toString());
-    else if (field === 'title') setEditingIncValue(inc.title);
-    else if (field === 'sourceTag') setEditingIncValue(inc.sourceTag || 'salary');
-    else if (field === 'accountId') setEditingIncValue(inc.accountId || '');
+
+    if (field === 'baseAmount') {
+      const base = inc.baseAmount !== undefined ? inc.baseAmount : inc.amount;
+      setEditingIncValue(base.toString());
+    } else if (field === 'title') {
+      setEditingIncValue(inc.title);
+    } else if (field === 'sourceTag') {
+      setEditingIncValue(inc.sourceTag || 'salary');
+    } else if (field === 'accountId') {
+      setEditingIncValue(inc.accountId || '');
+    }
   };
 
   // Handle save inline edit of income fields
   const handleSaveIncomeField = (inc: Income) => {
     if (!editingIncId || !editingIncField) return;
 
-    if (editingIncField === 'amount') {
+    if (editingIncField === 'baseAmount') {
+      const num = evaluateMathExpression(editingIncValue);
+      if (num !== null && num >= 0) {
+        // Direct assignment without compounding/delta inflation
+        if (onUpdateIncome) {
+          onUpdateIncome(inc.id, {
+            baseAmount: num,
+            amount: num,
+            availableBudgetAmount: num,
+          });
+        }
+      }
+    } else if (editingIncField === 'amount') {
       const num = evaluateMathExpression(editingIncValue);
       if (num !== null && num >= 0) {
         if (onUpdateIncome) {
-          onUpdateIncome(inc.id, { amount: num });
+          onUpdateIncome(inc.id, {
+            availableBudgetAmount: num,
+            amount: num,
+          });
         }
       }
     } else if (editingIncField === 'title') {
@@ -554,6 +824,8 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
         title: betweenIncTitle.trim(),
         sourceTag: betweenIncTag,
         amount: num,
+        baseAmount: num,
+        availableBudgetAmount: num,
         accountId: finalAccountId,
         status: 'expected',
         type: 'primary_salary',
@@ -697,43 +969,31 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
         {!isTopSectionCollapsed && (
           <>
             {/* Totals Quick Pill Grid */}
-            <div className="p-4 sm:p-5 border-b border-white/[0.06] bg-[#18181A] grid grid-cols-2 lg:grid-cols-5 gap-2.5">
-              {/* Opening Rollover Cash */}
-              <div className="bg-[#242426] p-3 rounded-[16px] border border-emerald-500/20">
-                <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-semibold text-slate-400 block">Opening Rollover Cash</span>
-                  <span className="text-[9px] font-bold px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300">
-                    Prev Cycle
-                  </span>
-                </div>
-                <span className="text-base font-bold font-mono text-emerald-400 block mt-0.5">
-                  {formatZAR(currentPeriod?.openingFloatingBalance || 0)}
-                </span>
-                <span className="text-[10px] text-slate-500 block mt-0.5 truncate">Carried from last cycle</span>
-              </div>
-
-              {/* Total Planned Income */}
-              <div className="bg-[#242426] p-3 rounded-[16px] border border-white/[0.06]">
-                <span className="text-[10px] font-semibold text-slate-400 block">Cycle Planned Income</span>
-                <span className="text-base font-bold font-mono text-[#30D158] block mt-0.5">
+            {/* Grand Cycle Metrics: 3 essential cards */}
+            <div className="p-4 sm:p-5 border-b border-white/[0.06] bg-[#18181A] grid grid-cols-1 md:grid-cols-3 gap-3">
+              {/* 1. Cycle Planned Income */}
+              <div className="bg-[#242426] p-3.5 rounded-[16px] border border-white/[0.06]">
+                <span className="text-[11px] font-semibold text-slate-400 block uppercase tracking-wider">Cycle Planned Income</span>
+                <span className="text-lg font-bold font-mono text-[#30D158] block mt-1">
                   {formatZAR(totalPlannedIncome)}
                 </span>
-                <span className="text-[10px] text-slate-500 block mt-0.5">{incomes.length} Income Streams</span>
+                <span className="text-[10px] text-slate-500 block mt-0.5">{externalIncomes.length} Income Streams</span>
               </div>
 
-              {/* Total Budgeted Expenses */}
-              <div className="bg-[#242426] p-3 rounded-[16px] border border-white/[0.06]">
-                <span className="text-[10px] font-semibold text-slate-400 block">Total Budget Envelopes</span>
-                <span className="text-base font-bold font-mono text-[#0A84FF] block mt-0.5">
+              {/* 2. Total Budgeted Envelopes */}
+              <div className="bg-[#242426] p-3.5 rounded-[16px] border border-white/[0.06]">
+                <span className="text-[11px] font-semibold text-slate-400 block uppercase tracking-wider">Total Budget Envelopes</span>
+                <span className="text-lg font-bold font-mono text-[#0A84FF] block mt-1">
                   {formatZAR(totalBudgetedExpenses)}
                 </span>
                 <span className="text-[10px] text-slate-500 block mt-0.5">{categories.length} Envelopes</span>
               </div>
 
-              <div className="bg-[#242426] p-3 rounded-[16px] border border-white/[0.06]">
-                <span className="text-[10px] font-semibold text-slate-400 block">Unassigned Balance</span>
+              {/* 3. Unassigned Balance */}
+              <div className="bg-[#242426] p-3.5 rounded-[16px] border border-white/[0.06]">
+                <span className="text-[11px] font-semibold text-slate-400 block uppercase tracking-wider">Unassigned Balance</span>
                 <span
-                  className={`text-base font-bold font-mono block mt-0.5 ${
+                  className={`text-lg font-bold font-mono block mt-1 ${
                     Math.abs(unassignedZeroBased) < 0.01
                       ? 'text-[#30D158]'
                       : unassignedZeroBased > 0
@@ -745,21 +1005,6 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
                 </span>
                 <span className="text-[10px] text-slate-500 block mt-0.5">
                   {Math.abs(unassignedZeroBased) < 0.01 ? 'Every Rand assigned' : 'Plan all funds'}
-                </span>
-              </div>
-
-              {/* Closing Floating Cash */}
-              <div className="bg-[#242426] p-3 rounded-[16px] border border-sky-500/20 col-span-2 lg:col-span-1">
-                <span className="text-[10px] font-semibold text-slate-400 block">Closing Floating Balance</span>
-                <span
-                  className={`text-base font-bold font-mono block mt-0.5 ${
-                    (currentPeriod?.closingFloatingBalance || 0) >= 0 ? 'text-sky-400' : 'text-[#FF453A]'
-                  }`}
-                >
-                  {formatZAR(currentPeriod?.closingFloatingBalance ?? (currentPeriod?.openingFloatingBalance || 0) + totalReceivedIncome - totalActualSpent)}
-                </span>
-                <span className="text-[10px] text-slate-500 block mt-0.5">
-                  Rolled to next cycle
                 </span>
               </div>
             </div>
@@ -783,6 +1028,22 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
                 </button>
               </div>
 
+              {reconcileFeedback && (
+                <div className="mb-3 py-2 px-3.5 rounded-[10px] bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs font-mono font-medium flex items-center justify-between animate-in fade-in duration-150 shadow-sm">
+                  <div className="flex items-center gap-2">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                    <span>{reconcileFeedback}</span>
+                  </div>
+                  <button
+                    onClick={() => setReconcileFeedback(null)}
+                    className="text-slate-400 hover:text-white p-0.5 rounded cursor-pointer ml-3"
+                    title="Dismiss"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+
               <div className="overflow-x-auto rounded-[16px] border border-white/[0.08]">
                 <table className="w-full text-left text-xs border-collapse font-sans">
                   <thead>
@@ -791,7 +1052,8 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
                       <th className="py-2.5 px-3 font-semibold text-slate-200 border-r border-white/[0.08] min-w-[180px]">Income Stream / Source</th>
                       <th className="py-2.5 px-3 font-semibold text-slate-300 border-r border-white/[0.08] w-28">Tag</th>
                       <th className="py-2.5 px-3 font-semibold text-slate-300 border-r border-white/[0.08] min-w-[140px]">Deposit Account</th>
-                      <th className="py-2.5 px-3 font-semibold text-slate-300 border-r border-white/[0.08] text-right w-32">Budgeted (R)</th>
+                      <th className="py-2.5 px-3 font-semibold text-slate-300 border-r border-white/[0.08] text-right w-32">Base Amount (R)</th>
+                      <th className="py-2.5 px-3 font-semibold text-slate-300 border-r border-white/[0.08] text-right w-36">Budgeted (R)</th>
                       <th className="py-2.5 px-3 font-semibold text-slate-300 border-r border-white/[0.08] text-right w-32">Actual Received</th>
                       <th className="py-2.5 px-3 font-semibold text-slate-300 border-r border-white/[0.08] text-center w-28">Status</th>
                       <th className="py-2.5 px-3 font-semibold text-slate-300 text-center w-36">Actions</th>
@@ -800,7 +1062,7 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
                   <tbody className="divide-y divide-white/[0.04] bg-[#1C1C1E]">
                     {filteredIncomes.length === 0 ? (
                       <tr>
-                        <td colSpan={8} className="py-8 text-center text-slate-400 text-xs">
+                        <td colSpan={9} className="py-8 text-center text-slate-400 text-xs">
                           <div className="flex flex-col items-center justify-center gap-2">
                             <p className="text-slate-300 font-semibold">No income streams logged yet</p>
                             <p className="text-slate-500 text-[11px]">
@@ -828,9 +1090,31 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
                           (inc.title && (inc.title.startsWith('Transfer from ') || inc.title.startsWith('ATM Cash Deposit')));
                         const isEditingTitle = editingIncId === inc.id && editingIncField === 'title';
                         const isEditingTag = editingIncId === inc.id && editingIncField === 'sourceTag';
+                        const isEditingBaseAmount = editingIncId === inc.id && editingIncField === 'baseAmount';
                         const isEditingAmount = editingIncId === inc.id && editingIncField === 'amount';
                         const isEditingAccount = editingIncId === inc.id && editingIncField === 'accountId';
                         const linkedAcc = inc.accountId ? accountMap.get(inc.accountId) : null;
+                        const isCreditCardRow = linkedAcc?.type === 'credit_card';
+
+                        // Accessible amount for credit card transfers (installment principal reduction vs direct full)
+                        const accessibleCreditCardAmt = (isCreditCardRow && isTransfer)
+                          ? getAccessibleIncomeAmount(inc, linkedAcc)
+                          : (inc.amount || 0);
+
+                        const baseAmountVal = (isCreditCardRow && isTransfer)
+                          ? accessibleCreditCardAmt
+                          : (inc.baseAmount !== undefined ? inc.baseAmount : inc.amount);
+
+                        const availableBudgetVal = (isCreditCardRow && isTransfer)
+                          ? accessibleCreditCardAmt
+                          : (inc.availableBudgetAmount !== undefined ? inc.availableBudgetAmount : inc.amount);
+
+                        const actualReceivedVal = (isCreditCardRow && isTransfer)
+                          ? (isReceived ? accessibleCreditCardAmt : 0)
+                          : (isReceived ? inc.amount : 0);
+
+                        const canEditBaseAmount = !isTransfer && inc.status === 'expected';
+                        const showReconcileBtn = !isTransfer && !isCreditCardRow;
 
                         return (
                           <React.Fragment key={inc.id}>
@@ -896,6 +1180,14 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
                                       <span className={`truncate group-hover/title:underline decoration-dashed decoration-slate-500 underline-offset-4 transition ${isTransfer ? 'group-hover/title:text-sky-300' : 'group-hover/title:text-emerald-400'}`}>
                                         {inc.title}
                                       </span>
+                                      {isCreditCardRow && isTransfer && inc.debtPaymentType === 'installment' && Boolean(inc.interestCharged || inc.feesCharged) && (
+                                        <span
+                                          className="text-[10px] text-amber-400 font-mono shrink-0 bg-amber-500/10 px-1.5 py-0.5 rounded border border-amber-500/20"
+                                          title={`Installment Payment: ${formatZAR(inc.amount)}. Accessible Principal: ${formatZAR(accessibleCreditCardAmt)} (Interest: ${formatZAR(inc.interestCharged || 0)}, Fees: ${formatZAR(inc.feesCharged || 0)})`}
+                                        >
+                                          Net Accessible
+                                        </span>
+                                      )}
                                       {inc.notes && <span className="text-[10px] text-slate-400 italic font-normal shrink-0">({inc.notes})</span>}
                                       <LastEditTag
                                         lastEditedBy={inc.lastEditedBy}
@@ -982,16 +1274,24 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
                                 </select>
                               </td>
 
-                            {/* Income Planned Amount (Inline Editable with Calculator) */}
+                            {/* Base Amount (R) - Fixed expected income (Editable only for Expected external incomes) */}
                             <td
-                              className="py-2 px-3 text-right font-mono font-bold text-[#30D158] border-r border-white/[0.06] cursor-pointer hover:bg-white/[0.02]"
+                              className={`py-2 px-3 text-right font-mono font-bold text-slate-300 border-r border-white/[0.06] ${
+                                canEditBaseAmount ? 'cursor-pointer hover:bg-white/[0.02]' : 'cursor-default'
+                              }`}
                               onClick={(e) => {
                                 e.stopPropagation();
-                                if (!isEditingAmount) handleStartEditIncome(inc, 'amount');
+                                if (canEditBaseAmount && !isEditingBaseAmount) handleStartEditIncome(inc, 'baseAmount');
                               }}
-                              title="Click to edit planned income (Supports +, -, *, /)"
+                              title={
+                                canEditBaseAmount
+                                  ? 'Base expected income (Click to edit, supports +, -, *, /)'
+                                  : isTransfer
+                                  ? 'Transfer income amount (Managed automatically by transfer)'
+                                  : 'Received income is locked (Switch status to Expected to edit base amount)'
+                              }
                             >
-                              {isEditingAmount ? (
+                              {isEditingBaseAmount ? (
                                 <div className="relative flex items-center justify-end gap-1" onClick={(e) => e.stopPropagation()}>
                                   <span className="text-slate-400 text-xs">R</span>
                                   <input
@@ -1018,18 +1318,30 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
                                   )}
                                 </div>
                               ) : (
-                                <div className="flex items-center justify-end gap-1.5 group/amt">
-                                  <span className="group-hover/amt:underline decoration-dashed decoration-slate-600 underline-offset-4 transition">
-                                    {formatZAR(inc.amount)}
+                                <div className="flex items-center justify-end gap-1.5 group/base">
+                                  <span className={canEditBaseAmount ? 'group-hover/base:underline decoration-dashed decoration-slate-500 underline-offset-4 transition' : ''}>
+                                    {formatZAR(baseAmountVal)}
                                   </span>
-                                  <Edit2 className="w-3 h-3 text-slate-500 opacity-0 group-hover/amt:opacity-100 transition shrink-0" />
+                                  {canEditBaseAmount && (
+                                    <Edit2 className="w-3 h-3 text-slate-500 opacity-0 group-hover/base:opacity-100 transition shrink-0" />
+                                  )}
                                 </div>
                               )}
                             </td>
 
+                            {/* Budgeted (R) - Available budget amount after transfers (System managed) */}
+                            <td
+                              className="py-2 px-3 text-right font-mono font-bold text-[#30D158] border-r border-white/[0.06] cursor-default"
+                              title="Available budgeted amount after outgoing internal transfers (System managed)"
+                            >
+                              <div className="flex items-center justify-end gap-1.5">
+                                <span>{formatZAR(availableBudgetVal)}</span>
+                              </div>
+                            </td>
+
                             {/* Actual Received */}
                             <td className="py-2 px-3 text-right font-mono font-bold text-white border-r border-white/[0.06]">
-                              {isReceived ? formatZAR(inc.amount) : 'R 0.00'}
+                              {isReceived ? formatZAR(actualReceivedVal) : 'R 0.00'}
                             </td>
 
                             {/* Status */}
@@ -1070,9 +1382,21 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
                               </button>
                             </td>
 
-                            {/* Actions: Edit, Delete */}
+                            {/* Actions: Reconcile, Copy, Edit, Delete */}
                             <td className="py-2 px-3 text-center">
                               <div className="flex items-center justify-center gap-1">
+                                {showReconcileBtn && (
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleReconcileTransfers(inc);
+                                    }}
+                                    className="w-6 h-6 rounded-[6px] flex items-center justify-center text-slate-400 hover:text-emerald-400 hover:bg-white/10 transition cursor-pointer"
+                                    title="Reconcile outgoing transfers for this account in this cycle"
+                                  >
+                                    <RefreshCw className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
                                 <button
                                   onClick={() => {
                                     setCopyTargetItem(inc);
@@ -1154,13 +1478,13 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
                               <td className="py-2 px-2">
                                 <input
                                   type="text"
-                                  placeholder="Amount (e.g. 1500)"
+                                  placeholder="Base Amount (e.g. 1500)"
                                   value={betweenIncAmount}
                                   onChange={(e) => setBetweenIncAmount(e.target.value)}
                                   className="w-full bg-[#1C1C1E] border border-emerald-500/50 text-white px-2 py-1 rounded-[6px] text-xs text-right font-mono"
                                 />
                               </td>
-                              <td colSpan={3} className="py-2 px-2 text-right">
+                              <td colSpan={4} className="py-2 px-2 text-right">
                                 <div className="flex items-center justify-end gap-1.5">
                                   <button
                                     onClick={() => setInsertingBetweenIncIndex(null)}
@@ -1184,7 +1508,7 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
 
                     {/* Quick Insert Income Row at bottom */}
                     <tr>
-                      <td colSpan={8} className="py-2.5 px-3 bg-[#1C1C1E]/50 border-t border-white/[0.06]">
+                      <td colSpan={9} className="py-2.5 px-3 bg-[#1C1C1E]/50 border-t border-white/[0.06]">
                         <button
                           onClick={onOpenAddIncomeModal}
                           className="flex items-center gap-1.5 px-3 py-1.5 rounded-[10px] bg-[#30D158]/15 hover:bg-[#30D158]/25 text-[#30D158] text-xs font-bold border border-[#30D158]/30 transition active:scale-95 cursor-pointer"
@@ -1199,6 +1523,9 @@ export const ExcelBudgetView: React.FC<ExcelBudgetViewProps> = ({
                     <tr className="bg-[#242426] border-t-2 border-emerald-500/40 font-mono font-bold text-xs">
                       <td colSpan={4} className="py-2.5 px-3 text-emerald-400 uppercase tracking-wider">
                         TOTAL INCOMES
+                      </td>
+                      <td className="py-2.5 px-3 text-right text-slate-300 font-extrabold border-r border-white/[0.06]">
+                        {formatZAR(totalBaseIncome)}
                       </td>
                       <td className="py-2.5 px-3 text-right text-[#30D158] font-extrabold border-r border-white/[0.06]">
                         {formatZAR(totalPlannedIncome)}

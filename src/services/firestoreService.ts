@@ -710,8 +710,23 @@ export async function saveIncome(income: Income): Promise<void> {
       console.warn('[DEBUG LOG][firestoreService] income.accountId is missing on income:', income.id);
     }
 
+    const isTransfer =
+      income.isTransfer === true ||
+      income.incomeClassification === 'internal_transfer' ||
+      Boolean(income.transferId);
+
+    const baseAmount = income.baseAmount !== undefined
+      ? income.baseAmount
+      : income.amount;
+
+    const availableBudgetAmount = income.availableBudgetAmount !== undefined
+      ? income.availableBudgetAmount
+      : income.amount;
+
     const cleanedPayload = cleanFirestoreObject({
       ...income,
+      baseAmount,
+      availableBudgetAmount,
       balanceBefore,
       balanceAfter,
       accountBalanceAtTransactionTime: accBalanceAtTime,
@@ -858,6 +873,54 @@ export async function deleteIncome(incomeId: string, transferId?: string): Promi
               status: 'active',
               updatedAt: new Date().toISOString(),
             });
+          }
+        }
+
+        // 4. Re-credit source account's available budget amount on its income document
+        let sourceIncIdToRecredit = pairedExpense.sourceIncomeId;
+        if (!sourceIncIdToRecredit && pairedExpense.accountId && pairedExpense.periodId) {
+          try {
+            const qS = query(
+              collection(db, 'incomes'),
+              where('periodId', '==', pairedExpense.periodId),
+              where('accountId', '==', pairedExpense.accountId)
+            );
+            const sSnap = await getDocs(qS);
+            const nonTrans = sSnap.docs.filter((d) => {
+              const data = d.data() as Income;
+              return d.id !== incomeId && !data.isTransfer && data.incomeClassification !== 'internal_transfer';
+            });
+            if (nonTrans.length > 0) {
+              sourceIncIdToRecredit = nonTrans[0].id;
+            } else if (!sSnap.empty && sSnap.docs[0].id !== incomeId) {
+              sourceIncIdToRecredit = sSnap.docs[0].id;
+            }
+          } catch (e) {
+            console.warn('[firestoreService] Could not locate source income for reversal:', e);
+          }
+        }
+
+        if (sourceIncIdToRecredit) {
+          try {
+            const sIncRef = doc(db, 'incomes', sourceIncIdToRecredit);
+            const sIncSnap = await getDoc(sIncRef);
+            if (sIncSnap.exists()) {
+              const sData = sIncSnap.data() as Income;
+              const curAvail = sData.availableBudgetAmount !== undefined
+                ? sData.availableBudgetAmount
+                : (sData.baseAmount !== undefined ? sData.baseAmount : sData.amount);
+              const curBase = sData.baseAmount !== undefined ? sData.baseAmount : sData.amount;
+              const amtToRecredit = pairedExpense.transferDeductedAmount !== undefined
+                ? pairedExpense.transferDeductedAmount
+                : pairedExpense.amount;
+              await updateDoc(sIncRef, {
+                baseAmount: curBase,
+                availableBudgetAmount: curAvail + amtToRecredit,
+                updatedAt: new Date().toISOString(),
+              });
+            }
+          } catch (err) {
+            console.warn('[firestoreService] Failed to re-credit source income on income delete:', err);
           }
         }
       } else {
@@ -1419,6 +1482,8 @@ export async function saveExpense(expense: Expense): Promise<void> {
           periodId: expense.periodId,
           title: incomeTitle,
           amount: effectiveIncomeAmount,
+          baseAmount: effectiveIncomeAmount,
+          availableBudgetAmount: effectiveIncomeAmount,
           type: 'other',
           incomeClassification: classification,
           isTransfer: true,
@@ -1426,6 +1491,8 @@ export async function saveExpense(expense: Expense): Promise<void> {
           status: 'received',
           receivedDate: expense.date,
           accountId: expense.targetAccountId,
+          sourceAccountId: expense.accountId,
+          targetAccountId: expense.targetAccountId,
           notes: expense.notes,
           transferId: expense.transferId || expense.id,
           linkedExpenseId: expense.id,
@@ -1441,6 +1508,38 @@ export async function saveExpense(expense: Expense): Promise<void> {
           updatedAt: new Date().toISOString(),
         })
       );
+
+      // Debit source account income document's availableBudgetAmount
+      if (expense.accountId && expense.periodId) {
+        try {
+          const qS = query(
+            collection(db, 'incomes'),
+            where('periodId', '==', expense.periodId),
+            where('accountId', '==', expense.accountId)
+          );
+          const snapS = await getDocs(qS);
+          const nonTransIncs = snapS.docs.filter((d) => {
+            const dData = d.data() as Income;
+            return !dData.isTransfer && dData.incomeClassification !== 'internal_transfer';
+          });
+          const targetSourceDoc = nonTransIncs.length > 0 ? nonTransIncs[0] : snapS.docs[0];
+          if (targetSourceDoc) {
+            const sData = targetSourceDoc.data() as Income;
+            const currentBase = sData.baseAmount !== undefined ? sData.baseAmount : sData.amount;
+            const currentAvail = sData.availableBudgetAmount !== undefined ? sData.availableBudgetAmount : currentBase;
+            const newAvail = currentAvail - expense.amount;
+            await updateDoc(targetSourceDoc.ref, {
+              baseAmount: currentBase,
+              availableBudgetAmount: newAvail,
+              updatedAt: new Date().toISOString(),
+            });
+            expense.sourceIncomeId = targetSourceDoc.id;
+            expense.transferDeductedAmount = expense.amount;
+          }
+        } catch (err) {
+          console.warn('[firestoreService] Could not debit source income available amount:', err);
+        }
+      }
     }
 
     await setDoc(
@@ -1601,6 +1700,60 @@ export async function deleteExpense(expenseId: string, transferId?: string): Pro
             status: 'active',
             updatedAt: new Date().toISOString(),
           });
+        }
+      }
+
+      // 4. Re-credit source account income availableBudgetAmount if internal transfer
+      const isTransferExp =
+        expData.isTransfer ||
+        expData.transferType === 'internal_transfer' ||
+        Boolean(effectiveTransferId) ||
+        Boolean(expData.sourceIncomeId);
+
+      if (isTransferExp) {
+        let sourceIncIdToRecredit = expData.sourceIncomeId;
+        if (!sourceIncIdToRecredit && expData.accountId && expData.periodId) {
+          try {
+            const qS = query(
+              collection(db, 'incomes'),
+              where('periodId', '==', expData.periodId),
+              where('accountId', '==', expData.accountId)
+            );
+            const sSnap = await getDocs(qS);
+            const nonTrans = sSnap.docs.filter((d) => {
+              const data = d.data() as Income;
+              return !data.isTransfer && data.incomeClassification !== 'internal_transfer';
+            });
+            if (nonTrans.length > 0) {
+              sourceIncIdToRecredit = nonTrans[0].id;
+            } else if (!sSnap.empty) {
+              sourceIncIdToRecredit = sSnap.docs[0].id;
+            }
+          } catch (e) {
+            console.warn('[firestoreService] Could not locate source income for reversal:', e);
+          }
+        }
+
+        if (sourceIncIdToRecredit) {
+          try {
+            const sIncRef = doc(db, 'incomes', sourceIncIdToRecredit);
+            const sIncSnap = await getDoc(sIncRef);
+            if (sIncSnap.exists()) {
+              const sData = sIncSnap.data() as Income;
+              const curAvail = sData.availableBudgetAmount !== undefined
+                ? sData.availableBudgetAmount
+                : (sData.baseAmount !== undefined ? sData.baseAmount : sData.amount);
+              const curBase = sData.baseAmount !== undefined ? sData.baseAmount : sData.amount;
+              const amtToRecredit = expData.transferDeductedAmount !== undefined ? expData.transferDeductedAmount : expData.amount;
+              await updateDoc(sIncRef, {
+                baseAmount: curBase,
+                availableBudgetAmount: curAvail + amtToRecredit,
+                updatedAt: new Date().toISOString(),
+              });
+            }
+          } catch (err) {
+            console.warn('[firestoreService] Failed to re-credit source income on expense delete:', err);
+          }
         }
       }
     }

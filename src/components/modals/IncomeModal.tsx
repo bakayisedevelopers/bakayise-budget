@@ -241,6 +241,8 @@ export const IncomeModal: React.FC<IncomeModalProps> = ({
       periodId: currentPeriodId,
       title: r.title.trim() || 'Income Stream',
       amount: r.amount > 0 ? r.amount : 0,
+      baseAmount: r.amount > 0 ? r.amount : 0,
+      availableBudgetAmount: r.amount > 0 ? r.amount : 0,
       type: r.type,
       sourceTag: r.sourceTag?.trim() || undefined,
       accountId: r.accountId || defaultAccountId,
@@ -280,11 +282,18 @@ export const IncomeModal: React.FC<IncomeModalProps> = ({
       return;
     }
 
+    const prevBase = initialIncome?.baseAmount !== undefined ? initialIncome.baseAmount : (initialIncome?.amount ?? numAmount);
+    const prevAvail = initialIncome?.availableBudgetAmount !== undefined ? initialIncome.availableBudgetAmount : (initialIncome?.amount ?? numAmount);
+    const delta = numAmount - prevBase;
+    const newAvail = Math.max(0, prevAvail + delta);
+
     const incomeData: Income = {
       id: initialIncome?.id || `inc_${Date.now()}`,
       periodId: currentPeriodId,
       title: title.trim(),
       amount: numAmount,
+      baseAmount: numAmount,
+      availableBudgetAmount: initialIncome ? newAvail : numAmount,
       type,
       sourceTag: sourceTag.trim() || undefined,
       accountId: accountId.trim(),
